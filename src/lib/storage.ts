@@ -1,0 +1,307 @@
+import type { NYTime, ChecklistData, UserData, TradeHistoryItem, SingleTradeData } from './types';
+import { isNewTradeData, isLegacyTradeData } from './types';
+import { STEPS, TRADING_CONFIG } from './checklist-config';
+
+const KEYS = {
+  USER_DATA: 'edgecore_nasdaq_data_',
+};
+
+// ========== CURRENT USER ID (set by auth hook) ==========
+
+let currentUserId: string | null = null;
+
+export function setCurrentUserId(id: string | null) {
+  currentUserId = id;
+}
+
+export function getCurrentUserId(): string | null {
+  return currentUserId;
+}
+
+// ========== USER DATA ==========
+
+function initUserData(userId: string) {
+  const userData: UserData = {
+    trades: {},
+    statistics: {
+      totalDays: 0, daysWithEntry: 0, daysNoEntry: 0,
+      totalWins: 0, totalLosses: 0, totalTrades: 0,
+      winRate: 0, totalPoints: 0, avgPointsPerTrade: 0,
+      checklistCompleteCount: 0, checklistCompletePercentage: 0,
+    },
+  };
+  localStorage.setItem(KEYS.USER_DATA + userId, JSON.stringify(userData));
+  return userData;
+}
+
+// ========== USER DATA ==========
+
+export function getUserData(): UserData | null {
+  const userId = getCurrentUserId();
+  if (!userId) return null;
+  const json = localStorage.getItem(KEYS.USER_DATA + userId);
+  if (!json) return initUserData(userId);
+  return JSON.parse(json);
+}
+
+export function saveUserData(userData: UserData) {
+  const userId = getCurrentUserId();
+  if (!userId) return;
+  localStorage.setItem(KEYS.USER_DATA + userId, JSON.stringify(userData));
+}
+
+// ========== CHECKLIST ==========
+
+export function createEmptyChecklist(): ChecklistData {
+  const checklist: Record<string, boolean[]> = {};
+  STEPS.forEach(step => {
+    checklist[step.id] = new Array(step.items).fill(false);
+  });
+  return {
+    date: formatDateKey(getNYTime()),
+    checklist,
+    hadEntry: undefined,
+    tradeData: null,
+    noEntryReasons: [],
+    notes: '',
+  };
+}
+
+export function getTodayChecklist(): ChecklistData {
+  const todayNY = getNYTime();
+  const dateKey = formatDateKey(todayNY);
+  const userData = getUserData();
+  if (userData?.trades[dateKey]) return userData.trades[dateKey];
+  return createEmptyChecklist();
+}
+
+export function saveTodayChecklist(data: ChecklistData) {
+  const userData = getUserData();
+  if (!userData) return;
+  const todayNY = getNYTime();
+  const dateKey = formatDateKey(todayNY);
+  data.savedAt = new Date().toISOString();
+  userData.trades[dateKey] = data;
+  updateStatistics(userData);
+  saveUserData(userData);
+}
+
+// ========== HELPERS TO GET ALL TRADES FROM A DAY ==========
+
+function getAllTradesFromDay(day: ChecklistData): SingleTradeData[] {
+  if (!day.hadEntry || !day.tradeData) return [];
+
+  if (isNewTradeData(day.tradeData)) {
+    return day.tradeData.trades;
+  }
+
+  if (isLegacyTradeData(day.tradeData)) {
+    // Convert legacy to single trade for stats
+    return [{
+      model: 'M1',
+      fvgCount: (day.tradeData.fvgCount || 1) as 1 | 2 | 3,
+      notes: day.tradeData.notes || '',
+      result: day.tradeData.result,
+      points: day.tradeData.points,
+    }];
+  }
+
+  return [];
+}
+
+// ========== STATISTICS ==========
+
+export function isChecklistComplete(checklist: Record<string, boolean[]>): boolean {
+  for (const step of STEPS) {
+    if (step.items === 0) continue;
+    const stepData = checklist[step.id];
+    if (!stepData) return false;
+    const items = stepData.slice(0, step.items);
+    if (!items.every(item => item === true)) return false;
+  }
+  return true;
+}
+
+export function getChecklistCompletion(checklist: Record<string, boolean[]>): number {
+  let total = 0;
+  let completed = 0;
+  STEPS.forEach(step => {
+    if (step.items === 0) return;
+    const stepData = checklist[step.id];
+    if (stepData && Array.isArray(stepData)) {
+      total += step.items;
+      completed += stepData.slice(0, step.items).filter(i => i === true).length;
+    }
+  });
+  return total > 0 ? Math.round((completed / total) * 100) : 0;
+}
+
+export function updateStatistics(userData: UserData) {
+  let totalDays = 0, daysWithEntry = 0, totalWins = 0, totalLosses = 0, totalPoints = 0, checklistCompleteCount = 0;
+
+  Object.values(userData.trades).forEach(day => {
+    if (day.checklist?.registro) delete day.checklist.registro;
+    totalDays++;
+    if (isChecklistComplete(day.checklist)) checklistCompleteCount++;
+
+    const trades = getAllTradesFromDay(day);
+    if (trades.length > 0) {
+      daysWithEntry++;
+      trades.forEach(trade => {
+        if (trade.result === 'win') { totalWins++; totalPoints += trade.points || 0; }
+        else if (trade.result === 'loss') { totalLosses++; totalPoints += trade.points || 0; }
+      });
+    }
+  });
+
+  const totalTrades = totalWins + totalLosses;
+  userData.statistics = {
+    totalDays, daysWithEntry, daysNoEntry: totalDays - daysWithEntry,
+    totalWins, totalLosses, totalTrades,
+    winRate: totalTrades > 0 ? Math.round((totalWins / totalTrades) * 100) : 0,
+    totalPoints: Math.round(totalPoints * 100) / 100,
+    avgPointsPerTrade: totalTrades > 0 ? Math.round((totalPoints / totalTrades) * 100) / 100 : 0,
+    checklistCompleteCount,
+    checklistCompletePercentage: totalDays > 0 ? Math.round((checklistCompleteCount / totalDays) * 100) : 0,
+  };
+}
+
+// ========== HISTORY ==========
+
+export function getTradeHistory(filterDays: string = 'all'): TradeHistoryItem[] {
+  const userData = getUserData();
+  if (!userData) return [];
+
+  let trades: TradeHistoryItem[] = Object.entries(userData.trades).map(([date, data]) => ({ ...data, date }));
+  trades.sort((a, b) => b.date.localeCompare(a.date));
+
+  if (filterDays !== 'all') {
+    const days = parseInt(filterDays);
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    trades = trades.filter(t => new Date(t.date) >= cutoff);
+  }
+  return trades;
+}
+
+export function updateTradeResult(dateKey: string, tradeIndex: number, result: 'win' | 'loss') {
+  const userData = getUserData();
+  if (!userData?.trades[dateKey]) return;
+
+  const day = userData.trades[dateKey];
+
+  if (isNewTradeData(day.tradeData)) {
+    if (tradeIndex < day.tradeData.trades.length) {
+      day.tradeData.trades[tradeIndex].result = result;
+      day.tradeData.trades[tradeIndex].points = 0;
+    }
+  } else if (isLegacyTradeData(day.tradeData)) {
+    day.tradeData.result = result;
+    day.tradeData.points = 0;
+  }
+
+  updateStatistics(userData);
+  saveUserData(userData);
+}
+
+// ========== WEEKDAY STATS ==========
+
+export function getWeekdayStatistics(): { labels: string[]; data: number[] } {
+  const userData = getUserData();
+  const weekdays = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+  const stats = weekdays.map(() => ({ trades: 0, wins: 0 }));
+
+  if (userData) {
+    Object.entries(userData.trades).forEach(([dateStr, data]) => {
+      const trades = getAllTradesFromDay(data);
+      if (trades.length === 0) return;
+      const weekday = new Date(dateStr).getDay();
+      trades.forEach(trade => {
+        if (trade.result) {
+          stats[weekday].trades++;
+          if (trade.result === 'win') stats[weekday].wins++;
+        }
+      });
+    });
+  }
+
+  return {
+    labels: weekdays,
+    data: stats.map(s => s.trades > 0 ? Math.round((s.wins / s.trades) * 100) : 0),
+  };
+}
+
+export function getChecklistCorrelation(): { labels: string[]; data: number[] } {
+  const userData = getUserData();
+  const c100 = { trades: 0, wins: 0 };
+  const cBelow = { trades: 0, wins: 0 };
+
+  if (userData) {
+    Object.values(userData.trades).forEach(data => {
+      const trades = getAllTradesFromDay(data);
+      if (trades.length === 0) return;
+      const complete = isChecklistComplete(data.checklist);
+      const bucket = complete ? c100 : cBelow;
+      trades.forEach(trade => {
+        if (trade.result) {
+          bucket.trades++;
+          if (trade.result === 'win') bucket.wins++;
+        }
+      });
+    });
+  }
+
+  return {
+    labels: ['Checklist 100%', 'Checklist <100%'],
+    data: [
+      c100.trades > 0 ? Math.round((c100.wins / c100.trades) * 100) : 0,
+      cBelow.trades > 0 ? Math.round((cBelow.wins / cBelow.trades) * 100) : 0,
+    ],
+  };
+}
+
+// ========== TIME UTILITIES ==========
+
+export function getNYTime(): NYTime {
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: TRADING_CONFIG.TIMEZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(now);
+  const v: Record<string, string> = {};
+  parts.forEach(p => { if (p.type !== 'literal') v[p.type] = p.value; });
+
+  return {
+    year: parseInt(v.year), month: parseInt(v.month), day: parseInt(v.day),
+    hour: parseInt(v.hour), minute: parseInt(v.minute), second: parseInt(v.second),
+    dateString: `${v.year}-${v.month}-${v.day}`,
+    timeString: `${v.hour}:${v.minute}`,
+  };
+}
+
+export function isWithinTradingWindow(): boolean {
+  const ny = getNYTime();
+  const current = ny.hour * 60 + ny.minute;
+  const [sH, sM] = TRADING_CONFIG.WINDOW_START.split(':').map(Number);
+  const [eH, eM] = TRADING_CONFIG.WINDOW_END.split(':').map(Number);
+  return current >= sH * 60 + sM && current <= eH * 60 + eM;
+}
+
+export function formatDateKey(date: NYTime | string): string {
+  if (typeof date === 'string') return date;
+  return date.dateString;
+}
+
+export function formatDateDisplay(dateStr: string): string {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const d = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+  return d.toLocaleDateString('es-ES', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC',
+  });
+}
+
+// No init needed - user data is initialized on first access
